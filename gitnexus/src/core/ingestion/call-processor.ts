@@ -7,7 +7,7 @@ import { loadParser, loadLanguage } from '../tree-sitter/parser-loader.js';
 import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
 import { getLanguageFromFilename, yieldToEventLoop } from './utils.js';
-import type { ExtractedCall } from './workers/parse-worker.js';
+import type { ExtractedCall, ExtractedRoute } from './workers/parse-worker.js';
 
 /**
  * Node types that represent function/method definitions across languages.
@@ -37,6 +37,13 @@ const FUNCTION_NODE_TYPES = new Set([
   // Rust
   'function_item',
   'impl_item', // Methods inside impl blocks
+  // Kotlin (function_declaration already included above via JS/TS)
+  'anonymous_function',
+  'lambda_literal',
+  // PHP — no additional node types needed
+  // Swift
+  'init_declaration',
+  'deinit_declaration',
 ]);
 
 /**
@@ -57,7 +64,13 @@ const findEnclosingFunction = (
       let label = 'Function';
       
       // Different node types have different name locations
-      if (current.type === 'function_declaration' || 
+      // Swift init/deinit — handle before generic cases (more specific)
+      if (current.type === 'init_declaration' || current.type === 'deinit_declaration') {
+        const funcName = current.type === 'init_declaration' ? 'init' : 'deinit';
+        return generateId('Constructor', `${filePath}:${funcName}`);
+      }
+
+      if (current.type === 'function_declaration' ||
           current.type === 'function_definition' ||
           current.type === 'async_function_declaration' ||
           current.type === 'generator_function_declaration' ||
@@ -315,6 +328,22 @@ const BUILT_IN_NAMES = new Set([
   'open', 'read', 'write', 'close', 'append', 'extend', 'update',
   'super', 'type', 'isinstance', 'issubclass', 'getattr', 'setattr', 'hasattr',
   'enumerate', 'zip', 'sorted', 'reversed', 'min', 'max', 'sum', 'abs',
+  // Kotlin stdlib (IMPORTANT: keep in sync with parse-worker.ts BUILT_IN_NAMES)
+  'println', 'print', 'readLine', 'require', 'requireNotNull', 'check', 'assert', 'lazy', 'error',
+  'listOf', 'mapOf', 'setOf', 'mutableListOf', 'mutableMapOf', 'mutableSetOf',
+  'arrayOf', 'sequenceOf', 'also', 'apply', 'run', 'with', 'takeIf', 'takeUnless',
+  'TODO', 'buildString', 'buildList', 'buildMap', 'buildSet',
+  'repeat', 'synchronized',
+  // Kotlin coroutine builders & scope functions
+  'launch', 'async', 'runBlocking', 'withContext', 'coroutineScope',
+  'supervisorScope', 'delay',
+  // Kotlin Flow operators
+  'flow', 'flowOf', 'collect', 'emit', 'onEach', 'catch',
+  'buffer', 'conflate', 'distinctUntilChanged',
+  'flatMapLatest', 'flatMapMerge', 'combine',
+  'stateIn', 'shareIn', 'launchIn',
+  // Kotlin infix stdlib functions
+  'to', 'until', 'downTo', 'step',
   // C/C++ standard library and common kernel helpers
   'printf', 'fprintf', 'sprintf', 'snprintf', 'vprintf', 'vfprintf', 'vsprintf', 'vsnprintf',
   'scanf', 'fscanf', 'sscanf',
@@ -336,6 +365,37 @@ const BUILT_IN_NAMES = new Set([
   'mutex_lock', 'mutex_unlock', 'mutex_init',
   'kfree', 'kmalloc', 'kzalloc', 'kcalloc', 'krealloc', 'kvmalloc', 'kvfree',
   'get', 'put',
+  // Swift/iOS built-ins and standard library
+  'print', 'debugPrint', 'dump', 'fatalError', 'precondition', 'preconditionFailure',
+  'assert', 'assertionFailure', 'NSLog',
+  'abs', 'min', 'max', 'zip', 'stride', 'sequence', 'repeatElement',
+  'swap', 'withUnsafePointer', 'withUnsafeMutablePointer', 'withUnsafeBytes',
+  'autoreleasepool', 'unsafeBitCast', 'unsafeDowncast', 'numericCast',
+  'type', 'MemoryLayout',
+  // Swift collection/string methods (common noise)
+  'map', 'flatMap', 'compactMap', 'filter', 'reduce', 'forEach', 'contains',
+  'first', 'last', 'prefix', 'suffix', 'dropFirst', 'dropLast',
+  'sorted', 'reversed', 'enumerated', 'joined', 'split',
+  'append', 'insert', 'remove', 'removeAll', 'removeFirst', 'removeLast',
+  'isEmpty', 'count', 'index', 'startIndex', 'endIndex',
+  // UIKit/Foundation common methods (noise in call graph)
+  'addSubview', 'removeFromSuperview', 'layoutSubviews', 'setNeedsLayout',
+  'layoutIfNeeded', 'setNeedsDisplay', 'invalidateIntrinsicContentSize',
+  'addTarget', 'removeTarget', 'addGestureRecognizer',
+  'addConstraint', 'addConstraints', 'removeConstraint', 'removeConstraints',
+  'NSLocalizedString', 'Bundle',
+  'reloadData', 'reloadSections', 'reloadRows', 'performBatchUpdates',
+  'register', 'dequeueReusableCell', 'dequeueReusableSupplementaryView',
+  'beginUpdates', 'endUpdates', 'insertRows', 'deleteRows', 'insertSections', 'deleteSections',
+  'present', 'dismiss', 'pushViewController', 'popViewController', 'popToRootViewController',
+  'performSegue', 'prepare',
+  // GCD / async
+  'DispatchQueue', 'async', 'sync', 'asyncAfter',
+  'Task', 'withCheckedContinuation', 'withCheckedThrowingContinuation',
+  // Combine
+  'sink', 'store', 'assign', 'receive', 'subscribe',
+  // Notification / KVO
+  'addObserver', 'removeObserver', 'post', 'NotificationCenter',
 ]);
 
 const isBuiltInOrNoise = (name: string): boolean => BUILT_IN_NAMES.has(name);
@@ -395,4 +455,75 @@ export const processCallsFromExtracted = async (
   }
 
   onProgress?.(totalFiles, totalFiles);
+};
+
+/**
+ * Resolve pre-extracted Laravel routes to CALLS edges from route files to controller methods.
+ */
+export const processRoutesFromExtracted = async (
+  graph: KnowledgeGraph,
+  extractedRoutes: ExtractedRoute[],
+  symbolTable: SymbolTable,
+  importMap: ImportMap,
+  onProgress?: (current: number, total: number) => void
+) => {
+  for (let i = 0; i < extractedRoutes.length; i++) {
+    const route = extractedRoutes[i];
+    if (i % 50 === 0) {
+      onProgress?.(i, extractedRoutes.length);
+      await yieldToEventLoop();
+    }
+
+    if (!route.controllerName || !route.methodName) continue;
+
+    // Resolve controller class in symbol table
+    const controllerDefs = symbolTable.lookupFuzzy(route.controllerName);
+    if (controllerDefs.length === 0) continue;
+
+    // Prefer import-resolved match
+    const importedFiles = importMap.get(route.filePath);
+    let controllerDef = controllerDefs[0];
+    let confidence = controllerDefs.length === 1 ? 0.7 : 0.5;
+
+    if (importedFiles) {
+      for (const def of controllerDefs) {
+        if (importedFiles.has(def.filePath)) {
+          controllerDef = def;
+          confidence = 0.9;
+          break;
+        }
+      }
+    }
+
+    // Find the method on the controller
+    const methodId = symbolTable.lookupExact(controllerDef.filePath, route.methodName);
+    const sourceId = generateId('File', route.filePath);
+
+    if (!methodId) {
+      // Construct method ID manually
+      const guessedId = generateId('Method', `${controllerDef.filePath}:${route.methodName}`);
+      const relId = generateId('CALLS', `${sourceId}:route->${guessedId}`);
+      graph.addRelationship({
+        id: relId,
+        sourceId,
+        targetId: guessedId,
+        type: 'CALLS',
+        confidence: confidence * 0.8,
+        reason: 'laravel-route',
+      });
+      continue;
+    }
+
+    const relId = generateId('CALLS', `${sourceId}:route->${methodId}`);
+    graph.addRelationship({
+      id: relId,
+      sourceId,
+      targetId: methodId,
+      type: 'CALLS',
+      confidence,
+      reason: 'laravel-route',
+    });
+  }
+
+  onProgress?.(extractedRoutes.length, extractedRoutes.length);
 };

@@ -10,13 +10,15 @@ import v8 from 'v8';
 import cliProgress from 'cli-progress';
 import { runPipelineFromRepo } from '../core/ingestion/pipeline.js';
 import { initKuzu, loadGraphToKuzu, getKuzuStats, executeQuery, executeWithReusedStatement, closeKuzu, createFTSIndex, loadCachedEmbeddings } from '../core/kuzu/kuzu-adapter.js';
-import { runEmbeddingPipeline } from '../core/embeddings/embedding-pipeline.js';
+// Embedding imports are lazy (dynamic import) so onnxruntime-node is never
+// loaded when embeddings are not requested. This avoids crashes on Node
+// versions whose ABI is not yet supported by the native binary (#89).
 // disposeEmbedder intentionally not called — ONNX Runtime segfaults on cleanup (see #38)
 import { getStoragePaths, saveMeta, loadMeta, addToGitignore, registerRepo, getGlobalRegistryPath } from '../storage/repo-manager.js';
 import { getCurrentCommit, isGitRepo, getGitRoot } from '../storage/git.js';
 import { generateAIContextFiles } from './ai-context.js';
 import fs from 'fs/promises';
-import { registerClaudeHook } from './claude-hooks.js';
+
 
 const HEAP_MB = 8192;
 const HEAP_FLAG = `--max-old-space-size=${HEAP_MB}`;
@@ -256,6 +258,7 @@ export const analyzeCommand = async (
   if (!embeddingSkipped) {
     updateBar(90, 'Loading embedding model...');
     const t0Emb = Date.now();
+    const { runEmbeddingPipeline } = await import('../core/embeddings/embedding-pipeline.js');
     await runEmbeddingPipeline(
       executeQuery,
       executeWithReusedStatement,
@@ -288,8 +291,6 @@ export const analyzeCommand = async (
   await saveMeta(storagePath, meta);
   await registerRepo(repoPath, meta);
   await addToGitignore(repoPath);
-
-  const hookResult = await registerClaudeHook();
 
   const projectName = path.basename(repoPath);
   let aggregatedClusterCount = 0;
@@ -337,10 +338,6 @@ export const analyzeCommand = async (
 
   if (aiContext.files.length > 0) {
     console.log(`  Context: ${aiContext.files.join(', ')}`);
-  }
-
-  if (hookResult.registered) {
-    console.log(`  Hooks: ${hookResult.message}`);
   }
 
   // Show a quiet summary if some edge types needed fallback insertion

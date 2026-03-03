@@ -9,10 +9,18 @@ import CPP from 'tree-sitter-cpp';
 import CSharp from 'tree-sitter-c-sharp';
 import Go from 'tree-sitter-go';
 import Rust from 'tree-sitter-rust';
+import Kotlin from 'tree-sitter-kotlin';
 import PHP from 'tree-sitter-php';
+import { createRequire } from 'node:module';
 import { SupportedLanguages } from '../../../config/supported-languages.js';
 import { LANGUAGE_QUERIES } from '../tree-sitter-queries.js';
-import { getLanguageFromFilename } from '../utils.js';
+
+// tree-sitter-swift is an optionalDependency — may not be installed
+const _require = createRequire(import.meta.url);
+let Swift: any = null;
+try { Swift = _require('tree-sitter-swift'); } catch {}
+import { findSiblingChild, getLanguageFromFilename } from '../utils.js';
+import { detectFrameworkFromAST } from '../framework-detection.js';
 import { generateId } from '../../../lib/utils.js';
 
 // ============================================================================
@@ -29,6 +37,8 @@ interface ParsedNode {
     endLine: number;
     language: string;
     isExported: boolean;
+    astFrameworkMultiplier?: number;
+    astFrameworkReason?: string;
     description?: string;
   };
 }
@@ -70,6 +80,17 @@ export interface ExtractedHeritage {
   kind: string;
 }
 
+export interface ExtractedRoute {
+  filePath: string;
+  httpMethod: string;
+  routePath: string | null;
+  controllerName: string | null;
+  methodName: string | null;
+  middleware: string[];
+  prefix: string | null;
+  lineNumber: number;
+}
+
 export interface ParseWorkerResult {
   nodes: ParsedNode[];
   relationships: ParsedRelationship[];
@@ -77,6 +98,7 @@ export interface ParseWorkerResult {
   imports: ExtractedImport[];
   calls: ExtractedCall[];
   heritage: ExtractedHeritage[];
+  routes: ExtractedRoute[];
   fileCount: number;
 }
 
@@ -102,7 +124,9 @@ const languageMap: Record<string, any> = {
   [SupportedLanguages.CSharp]: CSharp,
   [SupportedLanguages.Go]: Go,
   [SupportedLanguages.Rust]: Rust,
+  [SupportedLanguages.Kotlin]: Kotlin,
   [SupportedLanguages.PHP]: PHP.php_only,
+  ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
 };
 
 const setLanguage = (language: SupportedLanguages, filePath: string): void => {
@@ -184,6 +208,23 @@ const isNodeExported = (node: any, name: string, language: string): boolean => {
       }
       return false;
 
+    // Kotlin: Default visibility is public (unlike Java)
+    // visibility_modifier is inside modifiers, a sibling of the name node within the declaration
+    case 'kotlin':
+      while (current) {
+        if (current.parent) {
+          const visMod = findSiblingChild(current.parent, 'modifiers', 'visibility_modifier');
+          if (visMod) {
+            const text = visMod.text;
+            if (text === 'private' || text === 'internal' || text === 'protected') return false;
+            if (text === 'public') return true;
+          }
+        }
+        current = current.parent;
+      }
+      // No visibility modifier = public (Kotlin default)
+      return true;
+
     case 'c':
     case 'cpp':
       return false;
@@ -206,6 +247,16 @@ const isNodeExported = (node: any, name: string, language: string): boolean => {
       // Top-level functions (no parent class) are globally accessible
       return true;
 
+    case 'swift':
+      while (current) {
+        if (current.type === 'modifiers' || current.type === 'visibility_modifier') {
+          const text = current.text || '';
+          if (text.includes('public') || text.includes('open')) return true;
+        }
+        current = current.parent;
+      }
+      return false;
+
     default:
       return false;
   }
@@ -221,7 +272,12 @@ const FUNCTION_NODE_TYPES = new Set([
   'function_definition', 'async_function_declaration', 'async_arrow_function',
   'method_declaration', 'constructor_declaration',
   'local_function_statement', 'function_item', 'impl_item',
-  'anonymous_function_creation_expression',  // PHP anonymous functions
+  // Kotlin
+  'lambda_literal',
+  // PHP
+  'anonymous_function',
+  // Swift initializers/deinitializers
+  'init_declaration', 'deinit_declaration',
 ]);
 
 /** Walk up AST to find enclosing function, return its generateId or null for top-level */
@@ -231,6 +287,12 @@ const findEnclosingFunctionId = (node: any, filePath: string): string | null => 
     if (FUNCTION_NODE_TYPES.has(current.type)) {
       let funcName: string | null = null;
       let label = 'Function';
+
+      if (current.type === 'init_declaration' || current.type === 'deinit_declaration') {
+        const funcName = current.type === 'init_declaration' ? 'init' : 'deinit';
+        const label = 'Constructor';
+        return generateId(label, `${filePath}:${funcName}`);
+      }
 
       if (['function_declaration', 'function_definition', 'async_function_declaration',
            'generator_function_declaration', 'function_item'].includes(current.type)) {
@@ -298,6 +360,22 @@ const BUILT_INS = new Set([
   'open', 'read', 'write', 'close', 'append', 'extend', 'update',
   'super', 'type', 'isinstance', 'issubclass', 'getattr', 'setattr', 'hasattr',
   'enumerate', 'zip', 'sorted', 'reversed', 'min', 'max', 'sum', 'abs',
+  // Kotlin stdlib (IMPORTANT: keep in sync with call-processor.ts BUILT_IN_NAMES)
+  'println', 'print', 'readLine', 'require', 'requireNotNull', 'check', 'assert', 'lazy', 'error',
+  'listOf', 'mapOf', 'setOf', 'mutableListOf', 'mutableMapOf', 'mutableSetOf',
+  'arrayOf', 'sequenceOf', 'also', 'apply', 'run', 'with', 'takeIf', 'takeUnless',
+  'TODO', 'buildString', 'buildList', 'buildMap', 'buildSet',
+  'repeat', 'synchronized',
+  // Kotlin coroutine builders & scope functions
+  'launch', 'async', 'runBlocking', 'withContext', 'coroutineScope',
+  'supervisorScope', 'delay',
+  // Kotlin Flow operators
+  'flow', 'flowOf', 'collect', 'emit', 'onEach', 'catch',
+  'buffer', 'conflate', 'distinctUntilChanged',
+  'flatMapLatest', 'flatMapMerge', 'combine',
+  'stateIn', 'shareIn', 'launchIn',
+  // Kotlin infix stdlib functions
+  'to', 'until', 'downTo', 'step',
   // C/C++ standard library
   'printf', 'fprintf', 'sprintf', 'snprintf', 'vprintf', 'vfprintf', 'vsprintf', 'vsnprintf',
   'scanf', 'fscanf', 'sscanf',
@@ -336,6 +414,37 @@ const BUILT_INS = new Set([
   'preg_match', 'preg_match_all', 'preg_replace', 'preg_split',
   'header', 'session_start', 'session_destroy', 'ob_start', 'ob_end_clean', 'ob_get_clean',
   'dd', 'dump',
+  // Swift/iOS built-ins and standard library
+  'print', 'debugPrint', 'dump', 'fatalError', 'precondition', 'preconditionFailure',
+  'assert', 'assertionFailure', 'NSLog',
+  'abs', 'min', 'max', 'zip', 'stride', 'sequence', 'repeatElement',
+  'swap', 'withUnsafePointer', 'withUnsafeMutablePointer', 'withUnsafeBytes',
+  'autoreleasepool', 'unsafeBitCast', 'unsafeDowncast', 'numericCast',
+  'type', 'MemoryLayout',
+  // Swift collection/string methods (common noise)
+  'map', 'flatMap', 'compactMap', 'filter', 'reduce', 'forEach', 'contains',
+  'first', 'last', 'prefix', 'suffix', 'dropFirst', 'dropLast',
+  'sorted', 'reversed', 'enumerated', 'joined', 'split',
+  'append', 'insert', 'remove', 'removeAll', 'removeFirst', 'removeLast',
+  'isEmpty', 'count', 'index', 'startIndex', 'endIndex',
+  // UIKit/Foundation common methods (noise in call graph)
+  'addSubview', 'removeFromSuperview', 'layoutSubviews', 'setNeedsLayout',
+  'layoutIfNeeded', 'setNeedsDisplay', 'invalidateIntrinsicContentSize',
+  'addTarget', 'removeTarget', 'addGestureRecognizer',
+  'addConstraint', 'addConstraints', 'removeConstraint', 'removeConstraints',
+  'NSLocalizedString', 'Bundle',
+  'reloadData', 'reloadSections', 'reloadRows', 'performBatchUpdates',
+  'register', 'dequeueReusableCell', 'dequeueReusableSupplementaryView',
+  'beginUpdates', 'endUpdates', 'insertRows', 'deleteRows', 'insertSections', 'deleteSections',
+  'present', 'dismiss', 'pushViewController', 'popViewController', 'popToRootViewController',
+  'performSegue', 'prepare',
+  // GCD / async
+  'DispatchQueue', 'async', 'sync', 'asyncAfter',
+  'Task', 'withCheckedContinuation', 'withCheckedThrowingContinuation',
+  // Combine
+  'sink', 'store', 'assign', 'receive', 'subscribe',
+  // Notification / KVO
+  'addObserver', 'removeObserver', 'post', 'NotificationCenter',
 ]);
 
 // ============================================================================
@@ -372,6 +481,51 @@ const getLabelFromCaptures = (captureMap: Record<string, any>): string | null =>
   return 'CodeElement';
 };
 
+const DEFINITION_CAPTURE_KEYS = [
+  'definition.function',
+  'definition.class',
+  'definition.interface',
+  'definition.method',
+  'definition.struct',
+  'definition.enum',
+  'definition.namespace',
+  'definition.module',
+  'definition.trait',
+  'definition.impl',
+  'definition.type',
+  'definition.const',
+  'definition.static',
+  'definition.typedef',
+  'definition.macro',
+  'definition.union',
+  'definition.property',
+  'definition.record',
+  'definition.delegate',
+  'definition.annotation',
+  'definition.constructor',
+  'definition.template',
+] as const;
+
+const getDefinitionNodeFromCaptures = (captureMap: Record<string, any>): any | null => {
+  for (const key of DEFINITION_CAPTURE_KEYS) {
+    if (captureMap[key]) return captureMap[key];
+  }
+  return null;
+};
+
+/**
+ * Append .* to a Kotlin import path if the AST has a wildcard_import sibling node.
+ * Pure function — returns a new string without mutating the input.
+ */
+const appendKotlinWildcard = (importPath: string, importNode: any): string => {
+  for (let i = 0; i < importNode.childCount; i++) {
+    if (importNode.child(i)?.type === 'wildcard_import') {
+      return importPath.endsWith('.*') ? importPath : `${importPath}.*`;
+    }
+  }
+  return importPath;
+};
+
 // ============================================================================
 // Process a batch of files
 // ============================================================================
@@ -384,6 +538,7 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
     imports: [],
     calls: [],
     heritage: [],
+    routes: [],
     fileCount: 0,
   };
 
@@ -434,14 +589,22 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
 
     // Process regular files for this language
     if (regularFiles.length > 0) {
-      setLanguage(language, regularFiles[0].path);
-      processFileGroup(regularFiles, language, queryString, result, onFileProcessed);
+      try {
+        setLanguage(language, regularFiles[0].path);
+        processFileGroup(regularFiles, language, queryString, result, onFileProcessed);
+      } catch {
+        // parser unavailable — skip this language group
+      }
     }
 
     // Process tsx files separately (different grammar)
     if (tsxFiles.length > 0) {
-      setLanguage(language, tsxFiles[0].path);
-      processFileGroup(tsxFiles, language, queryString, result, onFileProcessed);
+      try {
+        setLanguage(language, tsxFiles[0].path);
+        processFileGroup(tsxFiles, language, queryString, result, onFileProcessed);
+      } catch {
+        // parser unavailable — skip this language group
+      }
     }
   }
 
@@ -551,6 +714,378 @@ function extractEloquentRelationDescription(methodNode: any): string | null {
   return null;
 }
 
+// ============================================================================
+// Laravel Route Extraction (procedural AST walk)
+// ============================================================================
+
+interface RouteGroupContext {
+  middleware: string[];
+  prefix: string | null;
+  controller: string | null;
+}
+
+const ROUTE_HTTP_METHODS = new Set([
+  'get', 'post', 'put', 'patch', 'delete', 'options', 'any', 'match',
+]);
+
+const ROUTE_RESOURCE_METHODS = new Set(['resource', 'apiResource']);
+
+const RESOURCE_ACTIONS = ['index', 'create', 'store', 'show', 'edit', 'update', 'destroy'];
+const API_RESOURCE_ACTIONS = ['index', 'store', 'show', 'update', 'destroy'];
+
+/** Check if node is a scoped_call_expression with object 'Route' */
+function isRouteStaticCall(node: any): boolean {
+  if (node.type !== 'scoped_call_expression') return false;
+  const obj = node.childForFieldName?.('object') ?? node.children?.[0];
+  return obj?.text === 'Route';
+}
+
+/** Get the method name from a scoped_call_expression or member_call_expression */
+function getCallMethodName(node: any): string | null {
+  const nameNode = node.childForFieldName?.('name') ??
+    node.children?.find((c: any) => c.type === 'name');
+  return nameNode?.text ?? null;
+}
+
+/** Get the arguments node from a call expression */
+function getArguments(node: any): any {
+  return node.children?.find((c: any) => c.type === 'arguments') ?? null;
+}
+
+/** Find the closure body inside arguments */
+function findClosureBody(argsNode: any): any | null {
+  if (!argsNode) return null;
+  for (const child of argsNode.children ?? []) {
+    if (child.type === 'argument') {
+      for (const inner of child.children ?? []) {
+        if (inner.type === 'anonymous_function' ||
+            inner.type === 'arrow_function') {
+          return inner.childForFieldName?.('body') ??
+            inner.children?.find((c: any) => c.type === 'compound_statement');
+        }
+      }
+    }
+    if (child.type === 'anonymous_function' ||
+        child.type === 'arrow_function') {
+      return child.childForFieldName?.('body') ??
+        child.children?.find((c: any) => c.type === 'compound_statement');
+    }
+  }
+  return null;
+}
+
+/** Extract first string argument from arguments node */
+function extractFirstStringArg(argsNode: any): string | null {
+  if (!argsNode) return null;
+  for (const child of argsNode.children ?? []) {
+    const target = child.type === 'argument' ? child.children?.[0] : child;
+    if (!target) continue;
+    if (target.type === 'string' || target.type === 'encapsed_string') {
+      return extractStringContent(target);
+    }
+  }
+  return null;
+}
+
+/** Extract middleware from arguments — handles string or array */
+function extractMiddlewareArg(argsNode: any): string[] {
+  if (!argsNode) return [];
+  for (const child of argsNode.children ?? []) {
+    const target = child.type === 'argument' ? child.children?.[0] : child;
+    if (!target) continue;
+    if (target.type === 'string' || target.type === 'encapsed_string') {
+      const val = extractStringContent(target);
+      return val ? [val] : [];
+    }
+    if (target.type === 'array_creation_expression') {
+      const items: string[] = [];
+      for (const el of target.children ?? []) {
+        if (el.type === 'array_element_initializer') {
+          const str = el.children?.find((c: any) => c.type === 'string' || c.type === 'encapsed_string');
+          const val = str ? extractStringContent(str) : null;
+          if (val) items.push(val);
+        }
+      }
+      return items;
+    }
+  }
+  return [];
+}
+
+/** Extract Controller::class from arguments */
+function extractClassArg(argsNode: any): string | null {
+  if (!argsNode) return null;
+  for (const child of argsNode.children ?? []) {
+    const target = child.type === 'argument' ? child.children?.[0] : child;
+    if (target?.type === 'class_constant_access_expression') {
+      return target.children?.find((c: any) => c.type === 'name')?.text ?? null;
+    }
+  }
+  return null;
+}
+
+/** Extract controller class name from arguments: [Controller::class, 'method'] or 'Controller@method' */
+function extractControllerTarget(argsNode: any): { controller: string | null; method: string | null } {
+  if (!argsNode) return { controller: null, method: null };
+
+  const args: any[] = [];
+  for (const child of argsNode.children ?? []) {
+    if (child.type === 'argument') args.push(child.children?.[0]);
+    else if (child.type !== '(' && child.type !== ')' && child.type !== ',') args.push(child);
+  }
+
+  // Second arg is the handler
+  const handlerNode = args[1];
+  if (!handlerNode) return { controller: null, method: null };
+
+  // Array syntax: [UserController::class, 'index']
+  if (handlerNode.type === 'array_creation_expression') {
+    let controller: string | null = null;
+    let method: string | null = null;
+    const elements: any[] = [];
+    for (const el of handlerNode.children ?? []) {
+      if (el.type === 'array_element_initializer') elements.push(el);
+    }
+    if (elements[0]) {
+      const classAccess = findDescendant(elements[0], 'class_constant_access_expression');
+      if (classAccess) {
+        controller = classAccess.children?.find((c: any) => c.type === 'name')?.text ?? null;
+      }
+    }
+    if (elements[1]) {
+      const str = findDescendant(elements[1], 'string');
+      method = str ? extractStringContent(str) : null;
+    }
+    return { controller, method };
+  }
+
+  // String syntax: 'UserController@index'
+  if (handlerNode.type === 'string' || handlerNode.type === 'encapsed_string') {
+    const text = extractStringContent(handlerNode);
+    if (text?.includes('@')) {
+      const [controller, method] = text.split('@');
+      return { controller, method };
+    }
+  }
+
+  // Class reference: UserController::class (invokable controller)
+  if (handlerNode.type === 'class_constant_access_expression') {
+    const controller = handlerNode.children?.find((c: any) => c.type === 'name')?.text ?? null;
+    return { controller, method: '__invoke' };
+  }
+
+  return { controller: null, method: null };
+}
+
+interface ChainedRouteCall {
+  isRouteFacade: boolean;
+  terminalMethod: string;
+  attributes: { method: string; argsNode: any }[];
+  terminalArgs: any;
+  node: any;
+}
+
+/**
+ * Unwrap a chained call like Route::middleware('auth')->prefix('api')->group(fn)
+ */
+function unwrapRouteChain(node: any): ChainedRouteCall | null {
+  if (node.type !== 'member_call_expression') return null;
+
+  const terminalMethod = getCallMethodName(node);
+  if (!terminalMethod) return null;
+
+  const terminalArgs = getArguments(node);
+  const attributes: { method: string; argsNode: any }[] = [];
+
+  let current = node.children?.[0];
+
+  while (current) {
+    if (current.type === 'member_call_expression') {
+      const method = getCallMethodName(current);
+      const args = getArguments(current);
+      if (method) attributes.unshift({ method, argsNode: args });
+      current = current.children?.[0];
+    } else if (current.type === 'scoped_call_expression') {
+      const obj = current.childForFieldName?.('object') ?? current.children?.[0];
+      if (obj?.text !== 'Route') return null;
+
+      const method = getCallMethodName(current);
+      const args = getArguments(current);
+      if (method) attributes.unshift({ method, argsNode: args });
+
+      return { isRouteFacade: true, terminalMethod, attributes, terminalArgs, node };
+    } else {
+      break;
+    }
+  }
+
+  return null;
+}
+
+/** Parse Route::group(['middleware' => ..., 'prefix' => ...], fn) array syntax */
+function parseArrayGroupArgs(argsNode: any): RouteGroupContext {
+  const ctx: RouteGroupContext = { middleware: [], prefix: null, controller: null };
+  if (!argsNode) return ctx;
+
+  for (const child of argsNode.children ?? []) {
+    const target = child.type === 'argument' ? child.children?.[0] : child;
+    if (target?.type === 'array_creation_expression') {
+      for (const el of target.children ?? []) {
+        if (el.type !== 'array_element_initializer') continue;
+        const children = el.children ?? [];
+        const arrowIdx = children.findIndex((c: any) => c.type === '=>');
+        if (arrowIdx === -1) continue;
+        const key = extractStringContent(children[arrowIdx - 1]);
+        const val = children[arrowIdx + 1];
+        if (key === 'middleware') {
+          if (val?.type === 'string') {
+            const s = extractStringContent(val);
+            if (s) ctx.middleware.push(s);
+          } else if (val?.type === 'array_creation_expression') {
+            for (const item of val.children ?? []) {
+              if (item.type === 'array_element_initializer') {
+                const str = item.children?.find((c: any) => c.type === 'string');
+                const s = str ? extractStringContent(str) : null;
+                if (s) ctx.middleware.push(s);
+              }
+            }
+          }
+        } else if (key === 'prefix') {
+          ctx.prefix = extractStringContent(val) ?? null;
+        } else if (key === 'controller') {
+          if (val?.type === 'class_constant_access_expression') {
+            ctx.controller = val.children?.find((c: any) => c.type === 'name')?.text ?? null;
+          }
+        }
+      }
+    }
+  }
+  return ctx;
+}
+
+function extractLaravelRoutes(tree: any, filePath: string): ExtractedRoute[] {
+  const routes: ExtractedRoute[] = [];
+
+  function resolveStack(stack: RouteGroupContext[]): { middleware: string[]; prefix: string | null; controller: string | null } {
+    const middleware: string[] = [];
+    let prefix: string | null = null;
+    let controller: string | null = null;
+    for (const ctx of stack) {
+      middleware.push(...ctx.middleware);
+      if (ctx.prefix) prefix = prefix ? `${prefix}/${ctx.prefix}`.replace(/\/+/g, '/') : ctx.prefix;
+      if (ctx.controller) controller = ctx.controller;
+    }
+    return { middleware, prefix, controller };
+  }
+
+  function emitRoute(
+    httpMethod: string,
+    argsNode: any,
+    lineNumber: number,
+    groupStack: RouteGroupContext[],
+    chainAttrs: { method: string; argsNode: any }[],
+  ) {
+    const effective = resolveStack(groupStack);
+
+    for (const attr of chainAttrs) {
+      if (attr.method === 'middleware') effective.middleware.push(...extractMiddlewareArg(attr.argsNode));
+      if (attr.method === 'prefix') {
+        const p = extractFirstStringArg(attr.argsNode);
+        if (p) effective.prefix = effective.prefix ? `${effective.prefix}/${p}` : p;
+      }
+      if (attr.method === 'controller') {
+        const cls = extractClassArg(attr.argsNode);
+        if (cls) effective.controller = cls;
+      }
+    }
+
+    const routePath = extractFirstStringArg(argsNode);
+
+    if (ROUTE_RESOURCE_METHODS.has(httpMethod)) {
+      const target = extractControllerTarget(argsNode);
+      const actions = httpMethod === 'apiResource' ? API_RESOURCE_ACTIONS : RESOURCE_ACTIONS;
+      for (const action of actions) {
+        routes.push({
+          filePath, httpMethod, routePath,
+          controllerName: target.controller ?? effective.controller,
+          methodName: action,
+          middleware: [...effective.middleware],
+          prefix: effective.prefix,
+          lineNumber,
+        });
+      }
+    } else {
+      const target = extractControllerTarget(argsNode);
+      routes.push({
+        filePath, httpMethod, routePath,
+        controllerName: target.controller ?? effective.controller,
+        methodName: target.method,
+        middleware: [...effective.middleware],
+        prefix: effective.prefix,
+        lineNumber,
+      });
+    }
+  }
+
+  function walk(node: any, groupStack: RouteGroupContext[]) {
+    // Case 1: Simple Route::get(...), Route::post(...), etc.
+    if (isRouteStaticCall(node)) {
+      const method = getCallMethodName(node);
+      if (method && (ROUTE_HTTP_METHODS.has(method) || ROUTE_RESOURCE_METHODS.has(method))) {
+        emitRoute(method, getArguments(node), node.startPosition.row, groupStack, []);
+        return;
+      }
+      if (method === 'group') {
+        const argsNode = getArguments(node);
+        const groupCtx = parseArrayGroupArgs(argsNode);
+        const body = findClosureBody(argsNode);
+        if (body) {
+          groupStack.push(groupCtx);
+          walkChildren(body, groupStack);
+          groupStack.pop();
+        }
+        return;
+      }
+    }
+
+    // Case 2: Fluent chain — Route::middleware(...)->group(...) or Route::middleware(...)->get(...)
+    const chain = unwrapRouteChain(node);
+    if (chain) {
+      if (chain.terminalMethod === 'group') {
+        const groupCtx: RouteGroupContext = { middleware: [], prefix: null, controller: null };
+        for (const attr of chain.attributes) {
+          if (attr.method === 'middleware') groupCtx.middleware.push(...extractMiddlewareArg(attr.argsNode));
+          if (attr.method === 'prefix') groupCtx.prefix = extractFirstStringArg(attr.argsNode);
+          if (attr.method === 'controller') groupCtx.controller = extractClassArg(attr.argsNode);
+        }
+        const body = findClosureBody(chain.terminalArgs);
+        if (body) {
+          groupStack.push(groupCtx);
+          walkChildren(body, groupStack);
+          groupStack.pop();
+        }
+        return;
+      }
+      if (ROUTE_HTTP_METHODS.has(chain.terminalMethod) || ROUTE_RESOURCE_METHODS.has(chain.terminalMethod)) {
+        emitRoute(chain.terminalMethod, chain.terminalArgs, node.startPosition.row, groupStack, chain.attributes);
+        return;
+      }
+    }
+
+    // Default: recurse into children
+    walkChildren(node, groupStack);
+  }
+
+  function walkChildren(node: any, groupStack: RouteGroupContext[]) {
+    for (const child of node.children ?? []) {
+      walk(child, groupStack);
+    }
+  }
+
+  walk(tree.rootNode, []);
+  return routes;
+}
+
 const processFileGroup = (
   files: ParseWorkerInput[],
   language: SupportedLanguages,
@@ -595,7 +1130,9 @@ const processFileGroup = (
 
       // Extract import paths before skipping
       if (captureMap['import'] && captureMap['import.source']) {
-        const rawImportPath = captureMap['import.source'].text.replace(/['"<>]/g, '');
+        const rawImportPath = language === SupportedLanguages.Kotlin
+          ? appendKotlinWildcard(captureMap['import.source'].text.replace(/['"<>]/g, ''), captureMap['import'])
+          : captureMap['import.source'].text.replace(/['"<>]/g, '');
         result.imports.push({
           filePath: file.path,
           rawImportPath,
@@ -654,8 +1191,12 @@ const processFileGroup = (
       if (!nodeLabel) continue;
 
       const nameNode = captureMap['name'];
-      const nodeName = nameNode.text;
-      const nodeId = generateId(nodeLabel, `${file.path}:${nodeName}`);
+      // Synthesize name for constructors without explicit @name capture (e.g. Swift init)
+      if (!nameNode && nodeLabel !== 'Constructor') continue;
+      const nodeName = nameNode ? nameNode.text : 'init';
+      const definitionNode = getDefinitionNodeFromCaptures(captureMap);
+      const startLine = definitionNode ? definitionNode.startPosition.row : (nameNode ? nameNode.startPosition.row : 0);
+      const nodeId = generateId(nodeLabel, `${file.path}:${nodeName}:${startLine}`);
 
       let description: string | undefined;
       if (language === SupportedLanguages.PHP) {
@@ -666,16 +1207,24 @@ const processFileGroup = (
         }
       }
 
+      const frameworkHint = definitionNode
+        ? detectFrameworkFromAST(language, (definitionNode.text || '').slice(0, 300))
+        : null;
+
       result.nodes.push({
         id: nodeId,
         label: nodeLabel,
         properties: {
           name: nodeName,
           filePath: file.path,
-          startLine: nameNode.startPosition.row,
-          endLine: nameNode.endPosition.row,
+          startLine: definitionNode ? definitionNode.startPosition.row : startLine,
+          endLine: definitionNode ? definitionNode.endPosition.row : startLine,
           language: language,
-          isExported: isNodeExported(nameNode, nodeName, language),
+          isExported: isNodeExported(nameNode || definitionNode, nodeName, language),
+          ...(frameworkHint ? {
+            astFrameworkMultiplier: frameworkHint.entryPointMultiplier,
+            astFrameworkReason: frameworkHint.reason,
+          } : {}),
           ...(description !== undefined ? { description } : {}),
         },
       });
@@ -698,6 +1247,12 @@ const processFileGroup = (
         reason: '',
       });
     }
+
+    // Extract Laravel routes from route files via procedural AST walk
+    if (language === SupportedLanguages.PHP && (file.path.includes('/routes/') || file.path.startsWith('routes/')) && file.path.endsWith('.php')) {
+      const extractedRoutes = extractLaravelRoutes(tree, file.path);
+      result.routes.push(...extractedRoutes);
+    }
   }
 };
 
@@ -708,7 +1263,7 @@ const processFileGroup = (
 /** Accumulated result across sub-batches */
 let accumulated: ParseWorkerResult = {
   nodes: [], relationships: [], symbols: [],
-  imports: [], calls: [], heritage: [], fileCount: 0,
+  imports: [], calls: [], heritage: [], routes: [], fileCount: 0,
 };
 let cumulativeProcessed = 0;
 
@@ -719,6 +1274,7 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   target.imports.push(...src.imports);
   target.calls.push(...src.calls);
   target.heritage.push(...src.heritage);
+  target.routes.push(...src.routes);
   target.fileCount += src.fileCount;
 };
 
@@ -740,7 +1296,7 @@ parentPort!.on('message', (msg: any) => {
     if (msg && msg.type === 'flush') {
       parentPort!.postMessage({ type: 'result', data: accumulated });
       // Reset for potential reuse
-      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], heritage: [], fileCount: 0 };
+      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], heritage: [], routes: [], fileCount: 0 };
       cumulativeProcessed = 0;
       return;
     }
